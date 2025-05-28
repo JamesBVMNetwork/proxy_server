@@ -47,6 +47,11 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[list[Any]] = None
     tool_choice: Optional[str] = None
 
+@app.get("/health")
+@app.get("/v1/health")
+async def health():
+    return {"status": "ok"}
+
 @app.get("/v1/models")
 @app.get("/models")
 async def models():
