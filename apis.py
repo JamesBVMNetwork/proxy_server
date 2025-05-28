@@ -14,6 +14,7 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+DEFAULT_MODEL = "gpt-4o-mini"
 
 app = FastAPI(title="OpenAI API Proxy")
 
@@ -32,7 +33,7 @@ async def shutdown_event():
 
 class ChatCompletionRequest(BaseModel):
     messages: Any
-    model: str = "gpt-4o-mini"
+    model: str = DEFAULT_MODEL
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     n: Optional[int] = None
@@ -46,6 +47,11 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[list[Any]] = None
     tool_choice: Optional[str] = None
 
+@app.get("/v1/models")
+@app.get("/models")
+async def models():
+    return {"data": [{"id": DEFAULT_MODEL, "object": "model"}]}
+
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def chat_completions(
@@ -55,7 +61,7 @@ async def chat_completions(
         "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
         "Content-Type": "application/json"
     }
-    request.model = "gpt-4o-mini"
+    request.model = DEFAULT_MODEL
 
     url = f"{OPENAI_API_BASE}/v1/chat/completions"
     
