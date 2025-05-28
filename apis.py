@@ -31,8 +31,8 @@ async def shutdown_event():
     await app.state.client.aclose()
 
 class ChatCompletionRequest(BaseModel):
-    model: str
     messages: Any
+    model: str = "gpt-4o-mini"
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     n: Optional[int] = None
@@ -43,63 +43,59 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = None
     logit_bias: Optional[Dict[str, float]] = None
     user: Optional[str] = None
-
-async def stream_generator(response: httpx.Response):
-    """
-    Generator for streaming responses from OpenAI.
-    Yields chunks of data as they are received, formatted for SSE.
-    """
-    try:
-        if response.status_code != 200:
-            error_text = await response.text()
-            error_msg = f"data: {{\"error\":{{\"message\":\"{error_text}\",\"code\":{response.status_code}}}}}\n\n"
-            logger.error(f"Streaming error: {response.status_code} - {error_text}")
-            yield error_msg
-            return
-
-        buffer = ""
-        async for chunk in response.aiter_bytes():
-            buffer += chunk.decode('utf-8')
-            while '\n' in buffer:
-                line, buffer = buffer.split('\n', 1)
-                if line.strip():
-                    yield f"{line}\n\n"
-        
-        # Process any remaining data in the buffer
-        if buffer.strip():
-            yield f"{buffer}\n\n"
-            
-    except Exception as e:
-        logger.error(f"Error during streaming: {e}")
-        yield f"data: {{\"error\":{{\"message\":\"{str(e)}\",\"code\":500}}}}\n\n"
+    tools: Optional[list[Any]] = None
+    tool_choice: Optional[str] = None
 
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def chat_completions(
-    request: ChatCompletionRequest,
-    authorization: Optional[str] = Header(None)
-):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header is required")
+    request: ChatCompletionRequest):
 
     headers = {
-        "Authorization": authorization,
+        "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
         "Content-Type": "application/json"
     }
+    request.model = "gpt-4o-mini"
 
     url = f"{OPENAI_API_BASE}/v1/chat/completions"
     
     try:
         if request.stream:
-            response = await app.state.client.stream(
-                "POST",
-                url,
-                headers=headers,
-                json=request.model_dump(exclude_none=True),
-                timeout=STREAM_TIMEOUT
-            )
+            # Use streaming response with proper context management
+            async def stream_response():
+                try:
+                    async with app.state.client.stream(
+                        "POST",
+                        url,
+                        headers=headers,
+                        json=request.model_dump(exclude_none=True),
+                        timeout=STREAM_TIMEOUT
+                    ) as response:
+                        if response.status_code != 200:
+                            error_text = await response.text()
+                            error_msg = f"data: {{\"error\":{{\"message\":\"{error_text}\",\"code\":{response.status_code}}}}}\n\n"
+                            logger.error(f"Streaming error: {response.status_code} - {error_text}")
+                            yield error_msg
+                            return
+
+                        buffer = ""
+                        async for chunk in response.aiter_bytes():
+                            buffer += chunk.decode('utf-8')
+                            while '\n' in buffer:
+                                line, buffer = buffer.split('\n', 1)
+                                if line.strip():
+                                    yield f"{line}\n\n"
+                        
+                        # Process any remaining data in the buffer
+                        if buffer.strip():
+                            yield f"{buffer}\n\n"
+                            
+                except Exception as e:
+                    logger.error(f"Error during streaming: {e}")
+                    yield f"data: {{\"error\":{{\"message\":\"{str(e)}\",\"code\":500}}}}\n\n"
+
             return StreamingResponse(
-                stream_generator(response),
+                stream_response(),
                 media_type="text/event-stream"
             )
         else:
