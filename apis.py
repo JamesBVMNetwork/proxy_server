@@ -44,8 +44,8 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = None
     logit_bias: Optional[Dict[str, float]] = None
     user: Optional[str] = None
-    tools: Optional[list[Any]] = None
-    tool_choice: Optional[str] = None
+    tools: Any = None
+    tool_choice: Any = None
 
 @app.get("/health")
 @app.get("/v1/health")
