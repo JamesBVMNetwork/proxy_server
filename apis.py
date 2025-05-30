@@ -1,92 +1,158 @@
+"""
+This module provides a FastAPI application that acts as a proxy for chat completion and embedding requests,
+forwarding them to an underlying service running on a local port.
+"""
+
 import os
 import logging
-import argparse
-from typing import Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, Header
-from fastapi.responses import StreamingResponse
 import httpx
-from dotenv import load_dotenv
-from pydantic import BaseModel
+import time
+import uvicorn
+from typing import Dict, List, Optional, Any
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+import sys
+from config import CONFIG
+from contextlib import asynccontextmanager
 
-# Load environment variables
-load_dotenv()
+# Import schemas from schema.py
+from schema import (
+    ChatCompletionRequest
+)
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+class ErrorHandlingStreamHandler(logging.StreamHandler):
+    """Custom stream handler that handles I/O errors gracefully"""
+    def emit(self, record):
+        try:
+            super().emit(record)
+        except OSError as e:
+            if e.errno == 5:  # Input/output error
+                pass
+            else:
+                raise
+
+# Set up logging
 logger = logging.getLogger(__name__)
-DEFAULT_MODEL = "gpt-4.1-mini"
+logger.setLevel(logging.WARNING if os.getenv("ENV") == "production" else logging.INFO)
 
-app = FastAPI(title="OpenAI API Proxy")
+handler = ErrorHandlingStreamHandler(sys.stderr)
+handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(handler)
 
-# OpenAI API base URL
-OPENAI_API_BASE = "https://api.openai.com"
-STREAM_TIMEOUT = 60.0  # seconds
+# Remove any existing handlers to avoid duplicate logging
+for existing_handler in logger.handlers[:]:
+    if not isinstance(existing_handler, ErrorHandlingStreamHandler):
+        logger.removeHandler(existing_handler)
 
-# Initialize the httpx client at startup
-@app.on_event("startup")
-async def startup_event():
-    app.state.client = httpx.AsyncClient()
+# Configure uvicorn access logger
+uvicorn_access_logger = logging.getLogger("uvicorn.access")
+uvicorn_access_logger.handlers = []
+uvicorn_access_handler = ErrorHandlingStreamHandler(sys.stderr)
+uvicorn_access_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+uvicorn_access_logger.addHandler(uvicorn_access_handler)
 
-@app.on_event("shutdown")
-async def shutdown_event():
+# Constants
+HTTP_TIMEOUT = 60.0
+STREAM_TIMEOUT = 600.0
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events"""
+    # Startup
+    app.state.client = httpx.AsyncClient(
+        timeout=HTTP_TIMEOUT,
+        transport=httpx.AsyncHTTPTransport(verify=False),
+        http2=True
+    )
+    logger.info("Service started successfully with HTTP/2 support")
+    
+    yield
+    
+    # Shutdown
     await app.state.client.aclose()
+    logger.info("Service shutdown complete")
 
-class ChatCompletionRequest(BaseModel):
-    messages: Any
-    model: str = DEFAULT_MODEL
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    n: Optional[int] = None
-    stream: Optional[bool] = None
-    stop: Optional[list[str]] = None
-    max_tokens: Optional[int] = None
-    presence_penalty: Optional[float] = None
-    frequency_penalty: Optional[float] = None
-    logit_bias: Optional[Dict[str, float]] = None
-    user: Optional[str] = None
-    tools: Any = None
-    tool_choice: Any = None
+app = FastAPI(
+    title="EternalAI Server",
+    description="Server for AI model inference",
+    version="2.0.0",
+    lifespan=lifespan,
+)
+
+# Configure CORS
+origins = [
+    "http://localhost",
+    "http://localhost:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:8000",
+]
+
+# Allow additional origins from environment variable
+if os.getenv("ALLOWED_ORIGINS"):
+    origins.extend(os.getenv("ALLOWED_ORIGINS").split(","))
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Process-Time"],
+    max_age=3600,
+)
 
 @app.get("/health")
 @app.get("/v1/health")
 async def health():
-    return {"status": "ok"}
+    """Health check endpoint"""
+    return {
+        "status": "ok"
+    }
 
 @app.get("/v1/models")
-@app.get("/models")
 async def models():
-    return {"data": [{"id": DEFAULT_MODEL, "object": "model"}]}
-
-@app.post("/v1/chat/completions")
-@app.post("/chat/completions")
-async def chat_completions(
-    request: ChatCompletionRequest):
-
-    headers = {
-        "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
-        "Content-Type": "application/json"
+    """Models endpoint"""
+    return {
+        "object": "list",
+        "data": [{
+            "id": CONFIG["model"]["id"],
+            "object": "model",
+        }]
     }
-    request.model = DEFAULT_MODEL
 
-    url = f"{OPENAI_API_BASE}/v1/chat/completions"
-    
+@app.post("/chat/completions")
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request, chat_request: ChatCompletionRequest) -> Any:
+    """Handle chat completion requests"""
     try:
-        if request.stream:
-            # Use streaming response with proper context management
-            async def stream_response():
+        chat_request.model = CONFIG["model"]["id"]
+        chat_request.temperature = 0.7
+        chat_request.top_k = 20
+        chat_request.top_p = 0.8
+        chat_request.presence_penalty = 1.5
+        chat_request.max_tokens = 8192
+        instance_url = CONFIG["instance_url"]
+        
+        request_payload = chat_request.dict()
+
+        if chat_request.stream:
+            async def stream_generator():
                 try:
-                    async with app.state.client.stream(
+                    async with request.app.state.client.stream(
                         "POST",
-                        url,
-                        headers=headers,
-                        json=request.model_dump(exclude_none=True),
+                        f"{instance_url}/v1/chat/completions",
+                        json=request_payload,
                         timeout=STREAM_TIMEOUT
                     ) as response:
                         if response.status_code != 200:
                             error_text = await response.text()
-                            error_msg = f"data: {{\"error\":{{\"message\":\"{error_text}\",\"code\":{response.status_code}}}}}\n\n"
+                            error_msg = {"error": {"message": error_text, "code": response.status_code}}
                             logger.error(f"Streaming error: {response.status_code} - {error_text}")
-                            yield error_msg
+                            yield f"data: {error_msg}\n\n"
+                            yield "data: [DONE]\n\n"
                             return
 
                         buffer = ""
@@ -96,40 +162,54 @@ async def chat_completions(
                                 line, buffer = buffer.split('\n', 1)
                                 if line.strip():
                                     yield f"{line}\n\n"
-                        
-                        # Process any remaining data in the buffer
+
                         if buffer.strip():
                             yield f"{buffer}\n\n"
                             
                 except Exception as e:
-                    logger.error(f"Error during streaming: {e}")
-                    yield f"data: {{\"error\":{{\"message\":\"{str(e)}\",\"code\":500}}}}\n\n"
+                    logger.error(f"Error in stream: {str(e)}")
+                    error_msg = {"error": {"message": str(e), "code": 500}}
+                    yield f"data: {error_msg}\n\n"
+                    yield "data: [DONE]\n\n"
 
             return StreamingResponse(
-                stream_response(),
+                stream_generator(),
                 media_type="text/event-stream"
             )
         else:
             response = await app.state.client.post(
-                url,
-                headers=headers,
-                json=request.model_dump(exclude_none=True),
-                timeout=STREAM_TIMEOUT
+                f"{instance_url}/v1/chat/completions",
+                json=request_payload,
+                timeout=HTTP_TIMEOUT
             )
+            if response.status_code != 200:
+                error_text = await response.text()
+                logger.error(f"Backend error: {response.status_code} - {error_text}")
+                if response.status_code == 400:
+                    raise HTTPException(status_code=400, detail=error_text)
+                raise HTTPException(status_code=response.status_code, detail=error_text)
             return response.json()
-            
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Request error: {e}")
-        raise HTTPException(status_code=502, detail=f"Error communicating with OpenAI: {str(e)}")
+        logger.error(f"Error processing chat completion: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Add middleware for request timing
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    """Add processing time header to responses"""
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    response.headers["X-Process-Time"] = str(process_time)
+    return response
 
 if __name__ == "__main__":
-    import uvicorn
-    
-    # Set up argument parser
-    parser = argparse.ArgumentParser(description='OpenAI API Proxy Server')
-    parser.add_argument('--port', type=int, default=8000, help='Port to run the server on (default: 8000)')
-    parser.add_argument('--host', type=str, default="0.0.0.0", help='Host to run the server on (default: 0.0.0.0)')
-    args = parser.parse_args()
-    
-    logger.info(f"Starting server on {args.host}:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(
+        "apis:app",
+        host="0.0.0.0",
+        port=CONFIG.get("proxy_port", 65534),
+        workers=CONFIG.get("workers", 1)
+    )
