@@ -4,3 +4,4 @@ python-dotenv==1.0.0
 httpx==0.26.0
 pydantic==2.6.1 
 pyyaml
+httpx[http2]
