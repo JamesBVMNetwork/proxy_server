@@ -1,5 +1,0 @@
-proxy_port: 9093
-model:
-  id: "Qwen/Qwen-32B"
-instance_url: http://localhost:8081
-workers: 8

@@ -9,12 +9,21 @@ import httpx
 import time
 import uvicorn
 from typing import Dict, List, Optional, Any
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import sys
-from config import CONFIG
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+from collections import defaultdict
+
+load_dotenv()
+
+LLM_URL = os.getenv("LLM_URL")
+MODEL_ID = os.getenv("MODEL_ID")
+FALL_BACK_URL = os.getenv("FALL_BACK_URL")
+FALL_BACK_MODEL_ID = os.getenv("FALL_BACK_MODEL_ID")
+API_KEY = os.getenv("API_KEY")
 
 # Import schemas from schema.py
 from schema import (
@@ -55,6 +64,52 @@ uvicorn_access_logger.addHandler(uvicorn_access_handler)
 # Constants
 HTTP_TIMEOUT = 60.0
 STREAM_TIMEOUT = 600.0
+HEALTH_CHECK_INTERVAL = 30.0
+MAX_CONNECTIONS = 100
+MAX_KEEPALIVE_CONNECTIONS = 20
+KEEPALIVE_TIMEOUT = 5.0
+RATE_LIMIT_REQUESTS = 100  # requests per minute
+RATE_LIMIT_WINDOW = 60  # seconds
+
+# Global state for instance health
+instance_state = {
+    "last_health_check": 0,
+    "is_primary_healthy": True,
+    "current_url": LLM_URL,
+    "current_model": MODEL_ID
+}
+
+# Rate limiting state
+rate_limit_state = defaultdict(lambda: {"count": 0, "window_start": time.time()})
+
+async def check_instance_health(url: str) -> bool:
+    """Check if an instance is healthy"""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{url}/health")
+            return response.status_code == 200
+    except Exception:
+        return False
+
+async def get_healthy_instance() -> tuple[str, str]:
+    """Get a healthy instance URL and model ID with caching"""
+    current_time = time.time()
+    
+    # Only check health if enough time has passed
+    if current_time - instance_state["last_health_check"] >= HEALTH_CHECK_INTERVAL:
+        is_primary_healthy = await check_instance_health(LLM_URL)
+        instance_state["is_primary_healthy"] = is_primary_healthy
+        instance_state["last_health_check"] = current_time
+        
+        if is_primary_healthy:
+            instance_state["current_url"] = LLM_URL
+            instance_state["current_model"] = MODEL_ID
+            return True, (instance_state["current_url"], instance_state["current_model"])
+        else:
+            instance_state["current_url"] = FALL_BACK_URL
+            instance_state["current_model"] = FALL_BACK_MODEL_ID
+    
+    return False, (instance_state["current_url"], instance_state["current_model"])
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -65,7 +120,7 @@ async def lifespan(app: FastAPI):
         transport=httpx.AsyncHTTPTransport(verify=False),
         http2=True
     )
-    logger.info("Service started successfully with HTTP/2 support")
+    logger.info("Service started successfully with HTTP/2 support and connection pooling")
     
     yield
     
@@ -108,9 +163,7 @@ app.add_middleware(
 @app.get("/v1/health")
 async def health():
     """Health check endpoint"""
-    return {
-        "status": "ok"
-    }
+    return {"status": "ok"}
 
 @app.get("/v1/models")
 async def models():
@@ -118,32 +171,74 @@ async def models():
     return {
         "object": "list",
         "data": [{
-            "id": CONFIG["model"]["id"],
+            "id": MODEL_ID,
             "object": "model",
         }]
     }
 
+async def rate_limit_middleware(request: Request):
+    """Rate limiting middleware"""
+    client_ip = request.client.host
+    current_time = time.time()
+    
+    # Reset counter if window has passed
+    if current_time - rate_limit_state[client_ip]["window_start"] >= RATE_LIMIT_WINDOW:
+        rate_limit_state[client_ip] = {"count": 0, "window_start": current_time}
+    
+    # Check rate limit
+    if rate_limit_state[client_ip]["count"] >= RATE_LIMIT_REQUESTS:
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Please try again later."
+        )
+    
+    # Increment counter
+    rate_limit_state[client_ip]["count"] += 1
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler"""
+    logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"error": {"message": "Internal server error", "code": 500}}
+    )
+
 @app.post("/chat/completions")
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request, chat_request: ChatCompletionRequest) -> Any:
+async def chat_completions(
+    request: Request,
+    chat_request: ChatCompletionRequest,
+    _: None = Depends(rate_limit_middleware)
+) -> Any:
     """Handle chat completion requests"""
     try:
-        chat_request.model = CONFIG["model"]["id"]
+        is_healthy, (instance_url, model_id) = await get_healthy_instance()
+
+        chat_request.model = model_id
         chat_request.temperature = 0.7
         chat_request.top_k = 20
         chat_request.top_p = 0.8
         chat_request.presence_penalty = 1.5
         chat_request.max_tokens = 8192
-        instance_url = CONFIG["instance_url"]
         
-        request_payload = chat_request.dict()
+        if not is_healthy:
+            request_payload = {
+                "messages": chat_request.messages,
+                "model": model_id,
+                "max_tokens": 1024,
+                "stream": chat_request.stream
+            }
+        else:
+            request_payload = chat_request.dict()
 
-        if chat_request.stream:
+        if request_payload["stream"]:
             async def stream_generator():
                 try:
                     async with request.app.state.client.stream(
                         "POST",
                         f"{instance_url}/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {API_KEY}"},
                         json=request_payload,
                         timeout=STREAM_TIMEOUT
                     ) as response:
@@ -155,17 +250,22 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
                             yield "data: [DONE]\n\n"
                             return
 
-                        buffer = ""
+                        # Process chunks more efficiently
                         async for chunk in response.aiter_bytes():
-                            buffer += chunk.decode('utf-8')
-                            while '\n' in buffer:
-                                line, buffer = buffer.split('\n', 1)
+                            # Decode chunk and split into lines
+                            chunk_text = chunk.decode('utf-8')
+                            lines = chunk_text.split('\n')
+                            
+                            # Process each line
+                            for line in lines:
                                 if line.strip():
                                     yield f"{line}\n\n"
-
-                        if buffer.strip():
-                            yield f"{buffer}\n\n"
                             
+                except httpx.TimeoutException:
+                    logger.error("Streaming request timed out")
+                    error_msg = {"error": {"message": "Request timed out", "code": 408}}
+                    yield f"data: {error_msg}\n\n"
+                    yield "data: [DONE]\n\n"
                 except Exception as e:
                     logger.error(f"Error in stream: {str(e)}")
                     error_msg = {"error": {"message": str(e), "code": 500}}
@@ -174,21 +274,34 @@ async def chat_completions(request: Request, chat_request: ChatCompletionRequest
 
             return StreamingResponse(
                 stream_generator(),
-                media_type="text/event-stream"
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
             )
         else:
-            response = await app.state.client.post(
-                f"{instance_url}/v1/chat/completions",
-                json=request_payload,
-                timeout=HTTP_TIMEOUT
-            )
-            if response.status_code != 200:
-                error_text = await response.text()
-                logger.error(f"Backend error: {response.status_code} - {error_text}")
-                if response.status_code == 400:
-                    raise HTTPException(status_code=400, detail=error_text)
-                raise HTTPException(status_code=response.status_code, detail=error_text)
-            return response.json()
+            try:
+                response = await app.state.client.post(
+                    f"{instance_url}/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                    json=request_payload,
+                    timeout=HTTP_TIMEOUT
+                )
+                if response.status_code != 200:
+                    error_text = await response.text()
+                    logger.error(f"Backend error: {response.status_code} - {error_text}")
+                    if response.status_code == 400:
+                        raise HTTPException(status_code=400, detail=error_text)
+                    raise HTTPException(status_code=response.status_code, detail=error_text)
+                return response.json()
+            except httpx.TimeoutException:
+                logger.error("Request timed out")
+                raise HTTPException(status_code=408, detail="Request timed out")
+            except httpx.RequestError as e:
+                logger.error(f"Request error: {str(e)}")
+                raise HTTPException(status_code=503, detail="Service unavailable")
 
     except HTTPException:
         raise
@@ -210,6 +323,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "apis:app",
         host="0.0.0.0",
-        port=CONFIG.get("proxy_port", 65534),
-        workers=CONFIG.get("workers", 1)
+        port=8000,
+        workers=8
     )

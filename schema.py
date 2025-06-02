@@ -5,17 +5,6 @@ Schema definitions for API requests and responses following OpenAI's API standar
 from typing_extensions import Literal
 from pydantic import BaseModel, Field, validator, root_validator
 from typing import List, Dict, Optional, Union, Any, ClassVar
-from config import CONFIG
-
-
-# Configuration
-class Config:
-    """
-    Configuration class holding the default model names for different types of requests.
-    """
-    TEXT_MODEL = "gpt-4-turbo"          # Default model for text-based chat completions
-    VISION_MODEL = "gpt-4-vision-preview"  # Model used for vision-based requests
-    EMBEDDING_MODEL = "text-embedding-ada-002"  # Model used for generating embeddings
 
 # Common models used in both streaming and non-streaming contexts
 class ImageUrl(BaseModel):
@@ -80,7 +69,7 @@ class ChatCompletionRequestBase(BaseModel):
     """
     Base model for chat completion requests.
     """
-    model: str = Field(CONFIG["model"]["id"], description="Model to use for completion")
+    model: str = Field("Self-hosted-model", description="Model to use for completion")
     max_tokens: Optional[int] = Field(4096, ge=1, description="Maximum number of tokens to generate")
     temperature: Optional[float] = Field(0.7, ge=0, le=2, description="Sampling temperature")
     top_p: Optional[float] = Field(0.8, ge=0, le=1, description="Nucleus sampling parameter")
@@ -146,7 +135,7 @@ class EmbeddingRequest(BaseModel):
     """
     Model for embedding requests.
     """
-    model: str = Field(Config.EMBEDDING_MODEL, description="Model to use for embedding")
+    model: str = Field("Self-hosted-model", description="Model to use for embedding")
     input: List[str] = Field(..., min_items=1, description="List of text inputs for embedding")
     image_url: Optional[str] = Field(None, description="Image URL to embed")
 
