@@ -8,7 +8,7 @@ import logging
 import httpx
 import time
 import uvicorn
-from typing import Dict, List, Optional, Any
+from typing import Any
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -176,25 +176,6 @@ async def models():
         }]
     }
 
-async def rate_limit_middleware(request: Request):
-    """Rate limiting middleware"""
-    client_ip = request.client.host
-    current_time = time.time()
-    
-    # Reset counter if window has passed
-    if current_time - rate_limit_state[client_ip]["window_start"] >= RATE_LIMIT_WINDOW:
-        rate_limit_state[client_ip] = {"count": 0, "window_start": current_time}
-    
-    # Check rate limit
-    if rate_limit_state[client_ip]["count"] >= RATE_LIMIT_REQUESTS:
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded. Please try again later."
-        )
-    
-    # Increment counter
-    rate_limit_state[client_ip]["count"] += 1
-
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Global exception handler"""
@@ -208,8 +189,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
-    chat_request: ChatCompletionRequest,
-    _: None = Depends(rate_limit_middleware)
+    chat_request: ChatCompletionRequest
 ) -> Any:
     """Handle chat completion requests"""
     try:
