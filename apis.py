@@ -118,7 +118,8 @@ async def lifespan(app: FastAPI):
     app.state.client = httpx.AsyncClient(
         timeout=HTTP_TIMEOUT,
         transport=httpx.AsyncHTTPTransport(verify=False),
-        http2=True
+        http2=True,
+        limits=httpx.Limits(max_connections=MAX_CONNECTIONS, max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS)
     )
     logger.info("Service started successfully with HTTP/2 support and connection pooling")
     
