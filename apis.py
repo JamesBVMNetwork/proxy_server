@@ -225,32 +225,28 @@ async def chat_completions(
                     ) as response:
                         if response.status_code != 200:
                             error_text = await response.text()
-                            error_msg = {"error": {"message": error_text, "code": response.status_code}}
+                            error_msg = f"data: {{\"error\":{{\"message\":\"{error_text}\",\"code\":{response.status_code}}}}}\n\n"
                             logger.error(f"Streaming error: {response.status_code} - {error_text}")
-                            yield f"data: {error_msg}\n\n"
-                            yield "data: [DONE]\n\n"
+                            yield error_msg
                             return
 
-                        # Process chunks more efficiently
+                        buffer = ""
                         async for chunk in response.aiter_bytes():
-                            # Decode chunk and split into lines
-                            chunk_text = chunk.decode('utf-8')
-                            lines = chunk_text.split('\n')
-                            
-                            # Process each line
-                            for line in lines:
+                            buffer += chunk.decode('utf-8')
+                            while '\n' in buffer:
+                                line, buffer = buffer.split('\n', 1)
                                 if line.strip():
                                     yield f"{line}\n\n"
-                            
+                        # Process any remaining data in the buffer
+                        if buffer.strip():
+                            yield f"{buffer}\n\n"
+
                 except httpx.TimeoutException:
                     logger.error("Streaming request timed out")
-                    error_msg = {"error": {"message": "Request timed out", "code": 408}}
-                    yield f"data: {error_msg}\n\n"
-                    yield "data: [DONE]\n\n"
+                    yield f"data: {{\"error\":{{\"message\":\"Request timed out\",\"code\":408}}}}\n\n"
                 except Exception as e:
-                    logger.error(f"Error in stream: {str(e)}")
-                    error_msg = {"error": {"message": str(e), "code": 500}}
-                    yield f"data: {error_msg}\n\n"
+                    logger.error(f"Error during streaming: {e}")
+                    yield f"data: {{\"error\":{{\"message\":\"{str(e)}\",\"code\":500}}}}\n\n"
                     yield "data: [DONE]\n\n"
 
             return StreamingResponse(
@@ -304,6 +300,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "apis:app",
         host="0.0.0.0",
-        port=8000,
+        port=6060,
         workers=8
     )
