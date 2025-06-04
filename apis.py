@@ -206,10 +206,7 @@ def build_request_payload(chat_request: ChatCompletionRequest, model_id: str, is
     elif not payload.get("tool_choice"):
         payload.pop("tool_choice", None)
 
-    print(
-        "payload",
-        payload
-    )
+
     return payload
 
 @app.post("/chat/completions")
@@ -256,6 +253,9 @@ async def chat_completions(
                                     content_str = chunk_obj.choices[0].delta.content
                                     if content_str:
                                         if content_str == "<tool_call>":
+                                            print(
+                                                "FOUND TOOL CALL"
+                                            )
                                             is_tool_call = True
                                             tool_calls_buffer += content_str
                                             continue     
@@ -266,8 +266,14 @@ async def chat_completions(
                                             tool_calls_buffer += content_str
                                             continue
                                         else:
+                                            print(
+                                                "TOOL CALL BUFFER", tool_calls_buffer
+                                            )
                                             if len(tool_calls_buffer) > 0:
                                                 res, _ = qwen3_tool_parser.parse(tool_calls_buffer)
+                                                print(
+                                                    "RES", res
+                                                )
                                                 for index, tool_call in enumerate(res):
                                                     tool_chunk = ChoiceDeltaToolCall(
                                                         index=index,
