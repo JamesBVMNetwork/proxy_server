@@ -176,11 +176,11 @@ def build_request_payload(chat_request: ChatCompletionRequest, model_id: str, is
     # Build payload dict with defaults
     payload = chat_request.dict()
     payload["model"] = model_id
-    payload["temperature"] = 0.6
+    payload["temperature"] = 0.7
     payload["top_k"] = 20
-    payload["top_p"] = 0.95
+    payload["top_p"] = 0.8
     payload["presence_penalty"] = 1.5
-    payload["max_tokens"] = 32768
+    payload["max_tokens"] = 8192
     payload["min_p"] = 0.0
     payload["seed"] = 0
     payload["frequency_penalty"] = 0.0
