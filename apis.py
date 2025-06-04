@@ -8,6 +8,7 @@ import logging
 import httpx
 import time
 import uvicorn
+import uuid
 from typing import Any, Dict
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -15,6 +16,11 @@ from fastapi.middleware.cors import CORSMiddleware
 import sys
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+from qwen3_tool_parser import qwen3_tool_parser
+
+
+QWEN3_TOOL_OPEN = "<tool_call>"
+QWEN3_TOOL_CLOSE = "</tool_call>"
 
 load_dotenv()
 
@@ -29,6 +35,15 @@ from schema import (
     ChatCompletionRequest,
     ChatCompletionChunk,
     ChatCompletionResponse,
+    ChoiceDeltaToolCall,
+    ChoiceDeltaFunctionCall,
+    StreamingChoice,
+    Delta,
+    Choice,
+    ChatCompletionResponse,
+    ChatCompletionRequest,
+    ChatCompletionChunk,
+    ChatCompletionMessageToolCall,
 )
 
 class ErrorHandlingStreamHandler(logging.StreamHandler):
@@ -223,6 +238,8 @@ async def chat_completions(
                         return
 
                     buffer = ""
+                    tool_calls_buffer = ""
+                    is_tool_call = False
                     async for chunk in response.aiter_bytes():
                         buffer += chunk.decode('utf-8')
                         while '\n' in buffer:
@@ -236,7 +253,79 @@ async def chat_completions(
                                         yield 'data: [DONE]\n\n'
                                         continue
                                     chunk_obj = ChatCompletionChunk.parse_raw(json_str)
-                                    yield f"data: {chunk_obj.json()}\n\n"
+                                    content_str = chunk_obj.choices[0].delta.content
+                                    if content_str:
+                                        if content_str == "<tool_call>":
+                                            is_tool_call = True
+                                            tool_calls_buffer += content_str
+                                            continue     
+                                        if content_str == "</tool_call>":
+                                            is_tool_call = False
+                                            continue
+                                        if is_tool_call:
+                                            tool_calls_buffer += content_str
+                                            continue
+                                        else:
+                                            if len(tool_calls_buffer) > 0:
+                                                res, _ = qwen3_tool_parser.parse(tool_calls_buffer)
+                                                for index, tool_call in enumerate(res):
+                                                    tool_chunk = ChoiceDeltaToolCall(
+                                                        index=index,
+                                                        type="function",
+                                                        id=str(uuid.uuid4()),
+                                                        function=ChoiceDeltaFunctionCall(
+                                                            name=tool_call["name"],
+                                                            arguments=""
+                                                        )
+                                                    )
+                                                    delta = Delta(
+                                                        content = None,
+                                                        function_call = tool_chunk.function,
+                                                        role = "assistant",
+                                                        tool_calls = [tool_chunk]
+                                                    ) 
+                                                    tool_choice = StreamingChoice(
+                                                        delta = delta,
+                                                        finish_reason = None,
+                                                        index = index
+                                                    )
+                                                    chunk_obj.choices[0] = tool_choice
+                                                    
+                                                    yield f"data: {chunk_obj.json()}\n\n"
+
+                                                    arg_tool_chunk = ChoiceDeltaToolCall(
+                                                        index=index,
+                                                        type="function",
+                                                        id=str(uuid.uuid4()),
+                                                        function=ChoiceDeltaFunctionCall(
+                                                            arguments=tool_call["arguments"]
+                                                        )
+                                                    )
+                                                    delta = Delta(
+                                                        content = None,
+                                                        function_call = arg_tool_chunk.function,
+                                                        role = "assistant",
+                                                        tool_calls = [arg_tool_chunk]
+                                                    )
+                                                    arg_tool_choice = StreamingChoice(
+                                                        delta = delta,
+                                                        finish_reason = None,
+                                                        index = index
+                                                    )
+                                                    chunk_obj.choices[0] = arg_tool_choice
+                                                    
+                                                    yield f"data: {chunk_obj.json()}\n\n"
+
+                                                final_choice = StreamingChoice(
+                                                    index=0,
+                                                    delta=Delta(role="assistant"),
+                                                    finish_reason="tool_calls"
+                                                )
+                                                chunk_obj.choices[0] = final_choice
+                                                yield f"data: {chunk_obj.json()}\n\n"
+                                            else:
+                                                yield f"data: {chunk_obj.json()}\n\n"
+                                                    
                                 except Exception as e:
                                     logger.error(f"Failed to parse streaming chunk: {e}; line: {line}")
                                     yield f"{line}\n\n"  # fallback: yield original
