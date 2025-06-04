@@ -188,6 +188,39 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"error": {"message": "Internal server error", "code": 500}}
     )
 
+def build_request_payload(chat_request, model_id, is_healthy):
+    logger.info("Calling build_request_payload")
+    # Set default parameters
+    chat_request.model = model_id
+    chat_request.temperature = 0.6
+    chat_request.top_k = 20
+    chat_request.top_p = 0.95
+    chat_request.presence_penalty = 1.5
+    chat_request.max_tokens = 32768
+    chat_request.min_p = 0.0
+    chat_request.seed = 0
+    chat_request.frequency_penalty = 0.0
+    if not is_healthy:
+        return {
+            "messages": chat_request.messages,
+            "model": model_id,
+            "max_tokens": 1024,
+            "stream": chat_request.stream,
+            "seed": 0,
+            "tools": chat_request.tools,
+            "tool_choice": chat_request.tool_choice,
+        }
+    payload = chat_request.dict()
+    if not payload.get("tools"):
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+    elif not payload.get("tool_choice"):
+        payload.pop("tool_choice", None)
+
+    print(payload)
+    
+    return payload
+
 @app.post("/chat/completions")
 @app.post("/v1/chat/completions")
 async def chat_completions(
@@ -195,38 +228,6 @@ async def chat_completions(
     chat_request: ChatCompletionRequest
 ) -> Any:
     """Handle chat completion requests"""
-    def build_request_payload(chat_request, model_id, is_healthy):
-        # Set default parameters
-        chat_request.model = model_id
-        chat_request.temperature = 0.6
-        chat_request.top_k = 20
-        chat_request.top_p = 0.95
-        chat_request.presence_penalty = 1.5
-        chat_request.max_tokens = 32768
-        chat_request.min_p = 0.0
-        chat_request.seed = 0
-        chat_request.frequency_penalty = 0.0
-        if not is_healthy:
-            return {
-                "messages": chat_request.messages,
-                "model": model_id,
-                "max_tokens": 1024,
-                "stream": chat_request.stream,
-                "seed": 0,
-                "tools": chat_request.tools,
-                "tool_choice": chat_request.tool_choice,
-            }
-        payload = chat_request.dict()
-        if not payload.get("tools"):
-            payload.pop("tools", None)
-            payload.pop("tool_choice", None)
-        elif not payload.get("tool_choice"):
-            payload.pop("tool_choice", None)
-
-        print(payload)
-        
-        return payload
-
     async def handle_streaming(instance_url, request_payload):
         async def stream_generator():
             try:
