@@ -27,7 +27,9 @@ API_KEY = os.getenv("API_KEY")
 
 # Import schemas from schema.py
 from schema import (
-    ChatCompletionRequest
+    ChatCompletionRequest,
+    ChatCompletionChunk,
+    ChatCompletionResponse,
 )
 
 class ErrorHandlingStreamHandler(logging.StreamHandler):
@@ -197,18 +199,24 @@ async def chat_completions(
         is_healthy, (instance_url, model_id) = await get_healthy_instance()
 
         chat_request.model = model_id
-        chat_request.temperature = 0.7
+        chat_request.temperature = 0.6
         chat_request.top_k = 20
-        chat_request.top_p = 0.8
+        chat_request.top_p = 0.95
         chat_request.presence_penalty = 1.5
-        chat_request.max_tokens = 8192
+        chat_request.max_tokens = 32768
+        chat_request.min_p = 0.0
+        chat_request.seed = 0
+        chat_request.frequency_penalty = 0.0
         
         if not is_healthy:
             request_payload = {
                 "messages": chat_request.messages,
                 "model": model_id,
                 "max_tokens": 1024,
-                "stream": chat_request.stream
+                "stream": chat_request.stream,
+                "seed": 0,
+                "tools": chat_request.tools,
+                "tool_choice": chat_request.tool_choice,
             }
         else:
             request_payload = chat_request.dict()
@@ -236,10 +244,34 @@ async def chat_completions(
                             while '\n' in buffer:
                                 line, buffer = buffer.split('\n', 1)
                                 if line.strip():
-                                    yield f"{line}\n\n"
+                                    try:
+                                        # Remove 'data: ' prefix if present
+                                        json_str = line.strip()
+                                        if json_str.startswith('data: '):
+                                            json_str = json_str[6:]
+                                        # Ignore [DONE] sentinel
+                                        if json_str.strip() == '[DONE]':
+                                            yield 'data: [DONE]\n\n'
+                                            continue
+                                        chunk_obj = ChatCompletionChunk.parse_raw(json_str)
+                                        yield f"data: {chunk_obj.json()}\n\n"
+                                    except Exception as e:
+                                        logger.error(f"Failed to parse streaming chunk: {e}; line: {line}")
+                                        yield f"{line}\n\n"  # fallback: yield original
                         # Process any remaining data in the buffer
                         if buffer.strip():
-                            yield f"{buffer}\n\n"
+                            try:
+                                json_str = buffer.strip()
+                                if json_str.startswith('data: '):
+                                    json_str = json_str[6:]
+                                if json_str.strip() != '[DONE]':
+                                    chunk_obj = ChatCompletionChunk.parse_raw(json_str)
+                                    yield f"data: {chunk_obj.json()}\n\n"
+                                else:
+                                    yield 'data: [DONE]\n\n'
+                            except Exception as e:
+                                logger.error(f"Failed to parse trailing streaming chunk: {e}; buffer: {buffer}")
+                                yield f"{buffer}\n\n"
 
                 except httpx.TimeoutException:
                     logger.error("Streaming request timed out")
@@ -272,7 +304,13 @@ async def chat_completions(
                     if response.status_code == 400:
                         raise HTTPException(status_code=400, detail=error_text)
                     raise HTTPException(status_code=response.status_code, detail=error_text)
-                return response.json()
+                # Parse and validate with ChatCompletionResponse
+                try:
+                    completion_obj = ChatCompletionResponse.parse_obj(response.json())
+                    return completion_obj.dict()
+                except Exception as e:
+                    logger.error(f"Failed to parse ChatCompletionResponse: {e}")
+                    raise HTTPException(status_code=500, detail="Invalid response format from backend")
             except httpx.TimeoutException:
                 logger.error("Request timed out")
                 raise HTTPException(status_code=408, detail="Request timed out")

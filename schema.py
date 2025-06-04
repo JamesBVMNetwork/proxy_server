@@ -102,7 +102,7 @@ class ChatTemplateKwargs(BaseModel):
     """
     Represents the arguments for a chat template.
     """
-    enable_thinking: bool = Field(False, description="Whether to enable thinking mode")
+    enable_thinking: bool = Field(True, description="Whether to enable thinking mode")
 
 # Non-streaming request and response
 class ChatCompletionRequest(ChatCompletionRequestBase):
@@ -161,3 +161,48 @@ class EmbeddingResponse(BaseModel):
     object: str = Field("list", description="Object type")
     data: List[Embedding] = Field(..., description="List of embeddings")
     model: str = Field(..., description="Model used for embedding")
+
+class ChoiceDeltaFunctionCall(BaseModel):
+    """
+    Represents a function call delta in a streaming response.
+    """
+    arguments: Optional[str] = Field(None, description="Arguments for the function call delta.")
+    name: Optional[str] = Field(None, description="Name of the function in the delta.")
+
+class ChoiceDeltaToolCall(BaseModel):
+    """
+    Represents a tool call delta in a streaming response.
+    """
+    index: Optional[int] = Field(None, description="Index of the tool call delta.")
+    id: Optional[str] = Field(None, description="ID of the tool call delta.")
+    function: Optional[ChoiceDeltaFunctionCall] = Field(None, description="Function call details in the delta.")
+    type: Optional[str] = Field(None, description="Type of the tool call delta.")
+
+class Delta(BaseModel):
+    """
+    Represents a delta in a streaming response.
+    """
+    content: Optional[str] = Field(None, description="Content of the delta.")
+    function_call: Optional[ChoiceDeltaFunctionCall] = Field(None, description="Function call delta, if any.")
+    refusal: Optional[str] = Field(None, description="Refusal reason, if any.")
+    role: Optional[Literal["system", "user", "assistant", "tool"]] = Field(None, description="Role in the delta.")
+    tool_calls: Optional[List[ChoiceDeltaToolCall]] = Field(None, description="List of tool call deltas, if any.")
+    reasoning_content: Optional[str] = Field(None, description="Reasoning content, if any.")
+
+class StreamingChoice(BaseModel):
+    """
+    Represents a choice in a streaming response.
+    """
+    delta: Delta = Field(..., description="The delta for this streaming choice.")
+    finish_reason: Optional[Literal["stop", "length", "tool_calls", "content_filter", "function_call"]] = Field(None, description="The reason for finishing, if any.")
+    index: int = Field(..., description="The index of the streaming choice.")
+    
+class ChatCompletionChunk(BaseModel):
+    """
+    Represents a chunk in a streaming chat completion response.
+    """
+    id: str = Field(..., description="The chunk ID.")
+    choices: List[StreamingChoice] = Field(..., description="List of streaming choices in the chunk.")
+    created: int = Field(..., description="The creation timestamp of the chunk.")
+    model: str = Field(..., description="The model used for the chunk.")
+    object: Literal["chat.completion.chunk"] = Field(..., description="The object type, always 'chat.completion.chunk'.") 
