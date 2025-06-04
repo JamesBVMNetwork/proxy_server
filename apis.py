@@ -190,6 +190,11 @@ def build_request_payload(chat_request: ChatCompletionRequest, model_id: str, is
         payload.pop("tool_choice", None)
     elif not payload.get("tool_choice"):
         payload.pop("tool_choice", None)
+
+    print(
+        "payload",
+        payload
+    )
     return payload
 
 @app.post("/chat/completions")
