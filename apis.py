@@ -233,7 +233,8 @@ async def chat_completions(
                     timeout=STREAM_TIMEOUT
                 ) as response:
                     if response.status_code != 200:
-                        error_text = await response.text()
+                        error_bytes = await response.aread()
+                        error_text = error_bytes.decode('utf-8', errors='replace')
                         error_msg = f"data: {{\"error\":{{\"message\":\"{error_text}\",\"code\":{response.status_code}}}}}\n\n"
                         logger.error(f"Streaming error: {response.status_code} - {error_text}")
                         yield error_msg
