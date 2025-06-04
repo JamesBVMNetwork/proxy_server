@@ -8,14 +8,13 @@ import logging
 import httpx
 import time
 import uvicorn
-from typing import Any
-from fastapi import FastAPI, HTTPException, Request, Depends
+from typing import Any, Dict
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import sys
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
-from collections import defaultdict
 
 load_dotenv()
 
@@ -43,22 +42,17 @@ class ErrorHandlingStreamHandler(logging.StreamHandler):
             else:
                 raise
 
-# Set up logging
+# Set up logging (simplified)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING if os.getenv("ENV") == "production" else logging.INFO)
-
+logger.handlers.clear()
 handler = ErrorHandlingStreamHandler(sys.stderr)
 handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 logger.addHandler(handler)
 
-# Remove any existing handlers to avoid duplicate logging
-for existing_handler in logger.handlers[:]:
-    if not isinstance(existing_handler, ErrorHandlingStreamHandler):
-        logger.removeHandler(existing_handler)
-
 # Configure uvicorn access logger
 uvicorn_access_logger = logging.getLogger("uvicorn.access")
-uvicorn_access_logger.handlers = []
+uvicorn_access_logger.handlers.clear()
 uvicorn_access_handler = ErrorHandlingStreamHandler(sys.stderr)
 uvicorn_access_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 uvicorn_access_logger.addHandler(uvicorn_access_handler)
@@ -66,37 +60,40 @@ uvicorn_access_logger.addHandler(uvicorn_access_handler)
 # Constants
 HTTP_TIMEOUT = 60.0
 STREAM_TIMEOUT = 600.0
-HEALTH_CHECK_INTERVAL = 30.0
+HEALTH_CHECK_CACHE_SECONDS = 10.0
 MAX_CONNECTIONS = 100
 MAX_KEEPALIVE_CONNECTIONS = 20
 KEEPALIVE_TIMEOUT = 5.0
-RATE_LIMIT_REQUESTS = 100  # requests per minute
-RATE_LIMIT_WINDOW = 60  # seconds
 
-# Global state for instance health
-instance_state = {
-    "last_health_check": 0,
-    "is_primary_healthy": True,
-    "current_url": LLM_URL,
-    "current_model": MODEL_ID
-}
+class InstanceState:
+    """Encapsulates instance health and model state with health check caching."""
+    def __init__(self):
+        self.last_health_check = 0.0
+        self.is_primary_healthy = True
+        self.current_url = LLM_URL
+        self.current_model = MODEL_ID
+        self._health_cache = None
+        self._health_cache_time = 0.0
 
-# Rate limiting state
-rate_limit_state = defaultdict(lambda: {"count": 0, "window_start": time.time()})
+    async def check_instance_health(self, url: str) -> bool:
+        now = time.time()
+        if self._health_cache is not None and (now - self._health_cache_time) < HEALTH_CHECK_CACHE_SECONDS:
+            return self._health_cache
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(f"{url}/health")
+                healthy = response.status_code == 200
+        except Exception:
+            healthy = False
+        self._health_cache = healthy
+        self._health_cache_time = now
+        return healthy
 
-async def check_instance_health(url: str) -> bool:
-    """Check if an instance is healthy"""
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(f"{url}/health")
-            return response.status_code == 200
-    except Exception:
-        return False
+instance_state = InstanceState()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan context manager for startup and shutdown events"""
-    # Startup
+    """Lifespan context manager for startup and shutdown events."""
     app.state.client = httpx.AsyncClient(
         timeout=HTTP_TIMEOUT,
         transport=httpx.AsyncHTTPTransport(verify=False),
@@ -104,10 +101,7 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_connections=MAX_CONNECTIONS, max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS)
     )
     logger.info("Service started successfully with HTTP/2 support and connection pooling")
-    
     yield
-    
-    # Shutdown
     await app.state.client.aclose()
     logger.info("Service shutdown complete")
 
@@ -127,10 +121,8 @@ origins = [
     "http://127.0.0.1:3000",
     "http://127.0.0.1:8000",
 ]
-
-# Allow additional origins from environment variable
 if os.getenv("ALLOWED_ORIGINS"):
-    origins.extend(os.getenv("ALLOWED_ORIGINS").split(","))
+    origins.extend([o.strip() for o in os.getenv("ALLOWED_ORIGINS").split(",") if o.strip()])
 
 app.add_middleware(
     CORSMiddleware,
@@ -144,13 +136,13 @@ app.add_middleware(
 
 @app.get("/health")
 @app.get("/v1/health")
-async def health():
-    """Health check endpoint"""
+async def health() -> Dict[str, str]:
+    """Health check endpoint."""
     return {"status": "ok"}
 
 @app.get("/v1/models")
-async def models():
-    """Models endpoint"""
+async def models() -> Dict[str, Any]:
+    """Models endpoint."""
     return {
         "object": "list",
         "data": [{
@@ -161,25 +153,16 @@ async def models():
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """Global exception handler"""
+    """Global exception handler."""
     logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
     return JSONResponse(
         status_code=500,
         content={"error": {"message": "Internal server error", "code": 500}}
     )
 
-def build_request_payload(chat_request, model_id, is_healthy):
+def build_request_payload(chat_request: ChatCompletionRequest, model_id: str, is_healthy: bool) -> Dict[str, Any]:
+    """Builds the payload for the backend request without mutating the input object."""
     logger.info("Calling build_request_payload")
-    # Set default parameters
-    chat_request.model = model_id
-    chat_request.temperature = 0.6
-    chat_request.top_k = 20
-    chat_request.top_p = 0.95
-    chat_request.presence_penalty = 1.5
-    chat_request.max_tokens = 32768
-    chat_request.min_p = 0.0
-    chat_request.seed = 0
-    chat_request.frequency_penalty = 0.0
     if not is_healthy:
         return {
             "messages": chat_request.messages,
@@ -190,16 +173,23 @@ def build_request_payload(chat_request, model_id, is_healthy):
             "tools": chat_request.tools,
             "tool_choice": chat_request.tool_choice,
         }
-    
+    # Build payload dict with defaults
     payload = chat_request.dict()
+    payload["model"] = model_id
+    payload["temperature"] = 0.6
+    payload["top_k"] = 20
+    payload["top_p"] = 0.95
+    payload["presence_penalty"] = 1.5
+    payload["max_tokens"] = 32768
+    payload["min_p"] = 0.0
+    payload["seed"] = 0
+    payload["frequency_penalty"] = 0.0
+    # Remove tools/tool_choice if not present
     if not payload.get("tools"):
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
     elif not payload.get("tool_choice"):
         payload.pop("tool_choice", None)
-
-    print(payload)
-    
     return payload
 
 @app.post("/chat/completions")
@@ -208,8 +198,8 @@ async def chat_completions(
     request: Request,
     chat_request: ChatCompletionRequest
 ) -> Any:
-    """Handle chat completion requests"""
-    async def handle_streaming(instance_url, request_payload):
+    """Handle chat completion requests."""
+    async def handle_streaming(instance_url: str, request_payload: Dict[str, Any]) -> StreamingResponse:
         async def stream_generator():
             try:
                 async with request.app.state.client.stream(
@@ -276,7 +266,7 @@ async def chat_completions(
             }
         )
 
-    async def handle_non_streaming(instance_url, request_payload):
+    async def handle_non_streaming(instance_url: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
             response = await app.state.client.post(
                 f"{instance_url}/v1/chat/completions",
@@ -304,7 +294,7 @@ async def chat_completions(
             raise HTTPException(status_code=503, detail="Service unavailable")
 
     try:
-        is_healthy = await check_instance_health(LLM_URL)
+        is_healthy = await instance_state.check_instance_health(LLM_URL)
         instance_url = LLM_URL if is_healthy else FALL_BACK_URL
         model_id = MODEL_ID if is_healthy else FALL_BACK_MODEL_ID
         request_payload = build_request_payload(chat_request, model_id, is_healthy)
@@ -321,7 +311,7 @@ async def chat_completions(
 # Add middleware for request timing
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
-    """Add processing time header to responses"""
+    """Add processing time header to responses."""
     start_time = time.time()
     response = await call_next(request)
     process_time = time.time() - start_time
