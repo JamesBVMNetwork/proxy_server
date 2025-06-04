@@ -93,26 +93,6 @@ async def check_instance_health(url: str) -> bool:
     except Exception:
         return False
 
-async def get_healthy_instance() -> tuple[str, str]:
-    """Get a healthy instance URL and model ID with caching"""
-    current_time = time.time()
-    
-    # Only check health if enough time has passed
-    if current_time - instance_state["last_health_check"] >= HEALTH_CHECK_INTERVAL:
-        is_primary_healthy = await check_instance_health(LLM_URL)
-        instance_state["is_primary_healthy"] = is_primary_healthy
-        instance_state["last_health_check"] = current_time
-        
-        if is_primary_healthy:
-            instance_state["current_url"] = LLM_URL
-            instance_state["current_model"] = MODEL_ID
-            return True, (instance_state["current_url"], instance_state["current_model"])
-        else:
-            instance_state["current_url"] = FALL_BACK_URL
-            instance_state["current_model"] = FALL_BACK_MODEL_ID
-    
-    return False, (instance_state["current_url"], instance_state["current_model"])
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events"""
@@ -210,6 +190,7 @@ async def build_request_payload(chat_request, model_id, is_healthy):
             "tools": chat_request.tools,
             "tool_choice": chat_request.tool_choice,
         }
+    
     payload = chat_request.dict()
     if not payload.get("tools"):
         payload.pop("tools", None)
@@ -323,8 +304,10 @@ async def chat_completions(
             raise HTTPException(status_code=503, detail="Service unavailable")
 
     try:
-        is_healthy, (instance_url, model_id) = await get_healthy_instance()
-        request_payload = await build_request_payload(chat_request, model_id, is_healthy)
+        is_healthy = await check_instance_health(LLM_URL)
+        instance_url = LLM_URL if is_healthy else FALL_BACK_URL
+        model_id = MODEL_ID if is_healthy else FALL_BACK_MODEL_ID
+        request_payload = build_request_payload(chat_request, model_id, is_healthy)
         if request_payload.get("stream"):
             return await handle_streaming(instance_url, request_payload)
         else:
