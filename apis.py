@@ -8,28 +8,102 @@ import logging
 import httpx
 import time
 import uvicorn
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import sys
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+from dataclasses import dataclass
+from enum import Enum
 
 load_dotenv()
 
-LLM_URL = os.getenv("LLM_URL")
-MODEL_ID = os.getenv("MODEL_ID")
-FALL_BACK_URL = os.getenv("FALL_BACK_URL")
-FALL_BACK_MODEL_ID = os.getenv("FALL_BACK_MODEL_ID")
-API_KEY = os.getenv("API_KEY")
+class ProviderType(Enum):
+    SELF_HOSTED = "self_hosted"
+    OPENAI = "openai"
+    OPENROUTER = "openrouter"
+    DEEPINFRA = "deepinfra"
 
-# Import schemas from schema.py
-from schema import (
-    ChatCompletionRequest,
-    ChatCompletionChunk,
-    ChatCompletionResponse,
-)
+@dataclass
+class ProviderConfig:
+    """Configuration for an LLM provider"""
+    name: str
+    type: ProviderType
+    base_url: str
+    model_id: str
+    api_key: Optional[str] = None
+    priority: int = 0
+    timeout: float = 60.0
+    max_tokens: int = 8192
+    temperature: float = 0.7
+    top_p: float = 0.8
+    top_k: int = 20
+    presence_penalty: float = 1.5
+    frequency_penalty: float = 0.0
+    min_p: float = 0.0
+    seed: int = 0
+
+def load_provider_configs() -> List[ProviderConfig]:
+    """Load provider configurations from environment variables"""
+    providers = []
+    
+    # Self-hosted provider (highest priority)
+    if os.getenv("SELF_HOSTED_URL") and os.getenv("SELF_HOSTED_MODEL"):
+        providers.append(ProviderConfig(
+            name="Self-hosted",
+            type=ProviderType.SELF_HOSTED,
+            base_url=os.getenv("SELF_HOSTED_URL"),
+            model_id=os.getenv("SELF_HOSTED_MODEL"),
+            priority=0
+        ))
+    
+    # OpenAI provider
+    if os.getenv("OPENAI_API_KEY"):
+        providers.append(ProviderConfig(
+            name="OpenAI",
+            type=ProviderType.OPENAI,
+            base_url="https://api.openai.com/v1",
+            model_id=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
+            api_key=os.getenv("OPENAI_API_KEY"),
+            priority=1
+        ))
+    
+    # OpenRouter provider
+    if os.getenv("OPENROUTER_API_KEY"):
+        providers.append(ProviderConfig(
+            name="OpenRouter",
+            type=ProviderType.OPENROUTER,
+            base_url="https://openrouter.ai/api/v1",
+            model_id=os.getenv("OPENROUTER_MODEL", "openai/gpt-3.5-turbo"),
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+            priority=2
+        ))
+    
+    # DeepInfra provider
+    if os.getenv("DEEPINFRA_API_KEY"):
+        providers.append(ProviderConfig(
+            name="DeepInfra",
+            type=ProviderType.DEEPINFRA,
+            base_url="https://api.deepinfra.com/v1",
+            model_id=os.getenv("DEEPINFRA_MODEL", "meta-llama/Llama-2-70b-chat-hf"),
+            api_key=os.getenv("DEEPINFRA_API_KEY"),
+            priority=3
+        ))
+    
+    return sorted(providers, key=lambda x: x.priority)
+
+# Load provider configurations
+PROVIDERS = load_provider_configs()
+
+# Constants
+HTTP_TIMEOUT = 60.0
+STREAM_TIMEOUT = 600.0
+HEALTH_CHECK_CACHE_SECONDS = 10.0
+MAX_CONNECTIONS = 100
+MAX_KEEPALIVE_CONNECTIONS = 20
+KEEPALIVE_TIMEOUT = 5.0
 
 class ErrorHandlingStreamHandler(logging.StreamHandler):
     """Custom stream handler that handles I/O errors gracefully"""
@@ -57,37 +131,67 @@ uvicorn_access_handler = ErrorHandlingStreamHandler(sys.stderr)
 uvicorn_access_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 uvicorn_access_logger.addHandler(uvicorn_access_handler)
 
-# Constants
-HTTP_TIMEOUT = 60.0
-STREAM_TIMEOUT = 600.0
-HEALTH_CHECK_CACHE_SECONDS = 10.0
-MAX_CONNECTIONS = 100
-MAX_KEEPALIVE_CONNECTIONS = 20
-KEEPALIVE_TIMEOUT = 5.0
-
 class InstanceState:
     """Encapsulates instance health and model state with health check caching."""
     def __init__(self):
-        self.last_health_check = 0.0
-        self.is_primary_healthy = True
-        self.current_url = LLM_URL
-        self.current_model = MODEL_ID
-        self._health_cache = None
-        self._health_cache_time = 0.0
+        self.provider_states = {}
+        for provider in PROVIDERS:
+            self.provider_states[provider.name] = {
+                "last_health_check": 0.0,
+                "is_healthy": True,
+                "_health_cache": None,
+                "_health_cache_time": 0.0
+            }
 
-    async def check_instance_health(self, url: str) -> bool:
+    async def check_instance_health(self, provider: ProviderConfig) -> bool:
+        """Check health of a specific provider with caching."""
+        state = self.provider_states[provider.name]
         now = time.time()
-        if self._health_cache is not None and (now - self._health_cache_time) < HEALTH_CHECK_CACHE_SECONDS:
-            return self._health_cache
+        
+        # Return cached health status if available and not expired
+        if state["_health_cache"] is not None and (now - state["_health_cache_time"]) < HEALTH_CHECK_CACHE_SECONDS:
+            return state["_health_cache"]
+        
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(f"{url}/health")
+                # Different health check endpoints for different providers
+                if provider.type == ProviderType.SELF_HOSTED:
+                    health_url = f"{provider.base_url}/health"
+                elif provider.type == ProviderType.OPENAI:
+                    health_url = f"{provider.base_url}/models"
+                elif provider.type == ProviderType.OPENROUTER:
+                    health_url = f"{provider.base_url}/models"
+                elif provider.type == ProviderType.DEEPINFRA:
+                    health_url = f"{provider.base_url}/models"
+                else:
+                    health_url = f"{provider.base_url}/health"
+                
+                headers = {}
+                if provider.api_key:
+                    headers["Authorization"] = f"Bearer {provider.api_key}"
+                
+                response = await client.get(health_url, headers=headers)
                 healthy = response.status_code == 200
-        except Exception:
+        except Exception as e:
+            logger.error(f"Health check failed for {provider.name}: {str(e)}")
             healthy = False
-        self._health_cache = healthy
-        self._health_cache_time = now
+        
+        # Update cache
+        state["_health_cache"] = healthy
+        state["_health_cache_time"] = now
+        state["is_healthy"] = healthy
         return healthy
+
+    async def get_healthy_provider(self) -> Optional[ProviderConfig]:
+        """Get the first healthy provider based on priority."""
+        for provider in PROVIDERS:
+            if await self.check_instance_health(provider):
+                return provider
+        return None
+
+    def get_provider_state(self, provider_name: str) -> Dict[str, Any]:
+        """Get the current state of a provider."""
+        return self.provider_states.get(provider_name, {})
 
 instance_state = InstanceState()
 
@@ -199,21 +303,25 @@ async def chat_completions(
     chat_request: ChatCompletionRequest
 ) -> Any:
     """Handle chat completion requests."""
-    async def handle_streaming(instance_url: str, request_payload: Dict[str, Any]) -> StreamingResponse:
+    async def handle_streaming(provider: ProviderConfig, request_payload: Dict[str, Any]) -> StreamingResponse:
         async def stream_generator():
             try:
+                headers = {"Content-Type": "application/json"}
+                if provider.api_key:
+                    headers["Authorization"] = f"Bearer {provider.api_key}"
+                
                 async with request.app.state.client.stream(
                     "POST",
-                    f"{instance_url}/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {API_KEY}"},
+                    f"{provider.base_url}/v1/chat/completions",
+                    headers=headers,
                     json=request_payload,
-                    timeout=STREAM_TIMEOUT
+                    timeout=provider.timeout
                 ) as response:
                     if response.status_code != 200:
                         error_bytes = await response.aread()
                         error_text = error_bytes.decode('utf-8', errors='replace')
                         error_msg = f"data: {{\"error\":{{\"message\":\"{error_text}\",\"code\":{response.status_code}}}}}\n\n"
-                        logger.error(f"Streaming error: {response.status_code} - {error_text}")
+                        logger.error(f"Streaming error from {provider.name}: {response.status_code} - {error_text}")
                         yield error_msg
                         return
 
@@ -233,9 +341,8 @@ async def chat_completions(
                                     chunk_obj = ChatCompletionChunk.parse_raw(json_str)
                                     yield f"data: {chunk_obj.json()}\n\n"
                                 except Exception as e:
-                                    logger.error(f"Failed to parse streaming chunk: {e}; line: {line}")
-                                    yield f"{line}\n\n"  # fallback: yield original
-                    # Process any remaining data in the buffer
+                                    logger.error(f"Failed to parse streaming chunk from {provider.name}: {e}; line: {line}")
+                                    yield f"{line}\n\n"
                     if buffer.strip():
                         try:
                             json_str = buffer.strip()
@@ -247,13 +354,13 @@ async def chat_completions(
                             else:
                                 yield 'data: [DONE]\n\n'
                         except Exception as e:
-                            logger.error(f"Failed to parse trailing streaming chunk: {e}; buffer: {buffer}")
+                            logger.error(f"Failed to parse trailing streaming chunk from {provider.name}: {e}; buffer: {buffer}")
                             yield f"{buffer}\n\n"
             except httpx.TimeoutException:
-                logger.error("Streaming request timed out")
+                logger.error(f"Streaming request timed out for {provider.name}")
                 yield f"data: {{\"error\":{{\"message\":\"Request timed out\",\"code\":408}}}}\n\n"
             except Exception as e:
-                logger.error(f"Error during streaming: {e}")
+                logger.error(f"Error during streaming from {provider.name}: {e}")
                 yield f"data: {{\"error\":{{\"message\":\"{str(e)}\",\"code\":500}}}}\n\n"
                 yield "data: [DONE]\n\n"
         return StreamingResponse(
@@ -266,17 +373,21 @@ async def chat_completions(
             }
         )
 
-    async def handle_non_streaming(instance_url: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def handle_non_streaming(provider: ProviderConfig, request_payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
+            headers = {"Content-Type": "application/json"}
+            if provider.api_key:
+                headers["Authorization"] = f"Bearer {provider.api_key}"
+            
             response = await app.state.client.post(
-                f"{instance_url}/v1/chat/completions",
-                headers={"Authorization": f"Bearer {API_KEY}"},
+                f"{provider.base_url}/v1/chat/completions",
+                headers=headers,
                 json=request_payload,
-                timeout=HTTP_TIMEOUT
+                timeout=provider.timeout
             )
             if response.status_code != 200:
                 error_text = await response.text()
-                logger.error(f"Backend error: {response.status_code} - {error_text}")
+                logger.error(f"Backend error from {provider.name}: {response.status_code} - {error_text}")
                 if response.status_code == 400:
                     raise HTTPException(status_code=400, detail=error_text)
                 raise HTTPException(status_code=response.status_code, detail=error_text)
@@ -284,24 +395,38 @@ async def chat_completions(
                 completion_obj = ChatCompletionResponse.parse_obj(response.json())
                 return completion_obj.dict()
             except Exception as e:
-                logger.error(f"Failed to parse ChatCompletionResponse: {e}")
+                logger.error(f"Failed to parse ChatCompletionResponse from {provider.name}: {e}")
                 raise HTTPException(status_code=500, detail="Invalid response format from backend")
         except httpx.TimeoutException:
-            logger.error("Request timed out")
+            logger.error(f"Request timed out for {provider.name}")
             raise HTTPException(status_code=408, detail="Request timed out")
         except httpx.RequestError as e:
-            logger.error(f"Request error: {str(e)}")
+            logger.error(f"Request error from {provider.name}: {str(e)}")
             raise HTTPException(status_code=503, detail="Service unavailable")
 
     try:
-        is_healthy = await instance_state.check_instance_health(LLM_URL)
-        instance_url = LLM_URL if is_healthy else FALL_BACK_URL
-        model_id = MODEL_ID if is_healthy else FALL_BACK_MODEL_ID
-        request_payload = build_request_payload(chat_request, model_id, is_healthy)
+        # Get the first healthy provider
+        provider = await instance_state.get_healthy_provider()
+        if not provider:
+            raise HTTPException(status_code=503, detail="No healthy providers available")
+        
+        # Build request payload with provider-specific settings
+        request_payload = build_request_payload(chat_request, provider.model_id, True)
+        request_payload.update({
+            "temperature": provider.temperature,
+            "top_p": provider.top_p,
+            "top_k": provider.top_k,
+            "presence_penalty": provider.presence_penalty,
+            "max_tokens": provider.max_tokens,
+            "min_p": provider.min_p,
+            "seed": provider.seed,
+            "frequency_penalty": provider.frequency_penalty
+        })
+        
         if request_payload.get("stream"):
-            return await handle_streaming(instance_url, request_payload)
+            return await handle_streaming(provider, request_payload)
         else:
-            return await handle_non_streaming(instance_url, request_payload)
+            return await handle_non_streaming(provider, request_payload)
     except HTTPException:
         raise
     except Exception as e:
