@@ -168,7 +168,7 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"error": {"message": "Internal server error", "code": 500}}
     )
 
-async def build_request_payload(chat_request, model_id, is_healthy):
+def build_request_payload(chat_request, model_id, is_healthy):
     logger.info("Calling build_request_payload")
     # Set default parameters
     chat_request.model = model_id
