@@ -217,10 +217,14 @@ async def chat_completions(
                 "tool_choice": chat_request.tool_choice,
             }
         payload = chat_request.dict()
-        if payload.get("tools") is None:
-            payload.pop("tools")
-            payload.pop("tool_choice")
-            
+        if not payload.get("tools"):
+            payload.pop("tools", None)
+            payload.pop("tool_choice", None)
+        elif not payload.get("tool_choice"):
+            payload.pop("tool_choice", None)
+
+        print(payload)
+        
         return payload
 
     async def handle_streaming(instance_url, request_payload):
