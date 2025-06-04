@@ -195,9 +195,8 @@ async def chat_completions(
     chat_request: ChatCompletionRequest
 ) -> Any:
     """Handle chat completion requests"""
-    try:
-        is_healthy, (instance_url, model_id) = await get_healthy_instance()
-
+    def build_request_payload(chat_request, model_id, is_healthy):
+        # Set default parameters
         chat_request.model = model_id
         chat_request.temperature = 0.6
         chat_request.top_k = 20
@@ -207,9 +206,8 @@ async def chat_completions(
         chat_request.min_p = 0.0
         chat_request.seed = 0
         chat_request.frequency_penalty = 0.0
-        
         if not is_healthy:
-            request_payload = {
+            return {
                 "messages": chat_request.messages,
                 "model": model_id,
                 "max_tokens": 1024,
@@ -218,106 +216,112 @@ async def chat_completions(
                 "tools": chat_request.tools,
                 "tool_choice": chat_request.tool_choice,
             }
-        else:
-            request_payload = chat_request.dict()
+        payload = chat_request.dict()
+        if payload.get("tools") is None:
+            payload.pop("tools", None)
+            payload.pop("tool_choice", None)
+        return payload
 
-        if request_payload["stream"]:
-            async def stream_generator():
-                try:
-                    async with request.app.state.client.stream(
-                        "POST",
-                        f"{instance_url}/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {API_KEY}"},
-                        json=request_payload,
-                        timeout=STREAM_TIMEOUT
-                    ) as response:
-                        if response.status_code != 200:
-                            error_text = await response.text()
-                            error_msg = f"data: {{\"error\":{{\"message\":\"{error_text}\",\"code\":{response.status_code}}}}}\n\n"
-                            logger.error(f"Streaming error: {response.status_code} - {error_text}")
-                            yield error_msg
-                            return
-
-                        buffer = ""
-                        async for chunk in response.aiter_bytes():
-                            buffer += chunk.decode('utf-8')
-                            while '\n' in buffer:
-                                line, buffer = buffer.split('\n', 1)
-                                if line.strip():
-                                    try:
-                                        # Remove 'data: ' prefix if present
-                                        json_str = line.strip()
-                                        if json_str.startswith('data: '):
-                                            json_str = json_str[6:]
-                                        # Ignore [DONE] sentinel
-                                        if json_str.strip() == '[DONE]':
-                                            yield 'data: [DONE]\n\n'
-                                            continue
-                                        chunk_obj = ChatCompletionChunk.parse_raw(json_str)
-                                        yield f"data: {chunk_obj.json()}\n\n"
-                                    except Exception as e:
-                                        logger.error(f"Failed to parse streaming chunk: {e}; line: {line}")
-                                        yield f"{line}\n\n"  # fallback: yield original
-                        # Process any remaining data in the buffer
-                        if buffer.strip():
-                            try:
-                                json_str = buffer.strip()
-                                if json_str.startswith('data: '):
-                                    json_str = json_str[6:]
-                                if json_str.strip() != '[DONE]':
-                                    chunk_obj = ChatCompletionChunk.parse_raw(json_str)
-                                    yield f"data: {chunk_obj.json()}\n\n"
-                                else:
-                                    yield 'data: [DONE]\n\n'
-                            except Exception as e:
-                                logger.error(f"Failed to parse trailing streaming chunk: {e}; buffer: {buffer}")
-                                yield f"{buffer}\n\n"
-
-                except httpx.TimeoutException:
-                    logger.error("Streaming request timed out")
-                    yield f"data: {{\"error\":{{\"message\":\"Request timed out\",\"code\":408}}}}\n\n"
-                except Exception as e:
-                    logger.error(f"Error during streaming: {e}")
-                    yield f"data: {{\"error\":{{\"message\":\"{str(e)}\",\"code\":500}}}}\n\n"
-                    yield "data: [DONE]\n\n"
-
-            return StreamingResponse(
-                stream_generator(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no"
-                }
-            )
-        else:
+    async def handle_streaming(instance_url, request_payload):
+        async def stream_generator():
             try:
-                response = await app.state.client.post(
+                async with request.app.state.client.stream(
+                    "POST",
                     f"{instance_url}/v1/chat/completions",
                     headers={"Authorization": f"Bearer {API_KEY}"},
                     json=request_payload,
-                    timeout=HTTP_TIMEOUT
-                )
-                if response.status_code != 200:
-                    error_text = await response.text()
-                    logger.error(f"Backend error: {response.status_code} - {error_text}")
-                    if response.status_code == 400:
-                        raise HTTPException(status_code=400, detail=error_text)
-                    raise HTTPException(status_code=response.status_code, detail=error_text)
-                # Parse and validate with ChatCompletionResponse
-                try:
-                    completion_obj = ChatCompletionResponse.parse_obj(response.json())
-                    return completion_obj.dict()
-                except Exception as e:
-                    logger.error(f"Failed to parse ChatCompletionResponse: {e}")
-                    raise HTTPException(status_code=500, detail="Invalid response format from backend")
-            except httpx.TimeoutException:
-                logger.error("Request timed out")
-                raise HTTPException(status_code=408, detail="Request timed out")
-            except httpx.RequestError as e:
-                logger.error(f"Request error: {str(e)}")
-                raise HTTPException(status_code=503, detail="Service unavailable")
+                    timeout=STREAM_TIMEOUT
+                ) as response:
+                    if response.status_code != 200:
+                        error_text = await response.text()
+                        error_msg = f"data: {{\"error\":{{\"message\":\"{error_text}\",\"code\":{response.status_code}}}}}\n\n"
+                        logger.error(f"Streaming error: {response.status_code} - {error_text}")
+                        yield error_msg
+                        return
 
+                    buffer = ""
+                    async for chunk in response.aiter_bytes():
+                        buffer += chunk.decode('utf-8')
+                        while '\n' in buffer:
+                            line, buffer = buffer.split('\n', 1)
+                            if line.strip():
+                                try:
+                                    json_str = line.strip()
+                                    if json_str.startswith('data: '):
+                                        json_str = json_str[6:]
+                                    if json_str.strip() == '[DONE]':
+                                        yield 'data: [DONE]\n\n'
+                                        continue
+                                    chunk_obj = ChatCompletionChunk.parse_raw(json_str)
+                                    yield f"data: {chunk_obj.json()}\n\n"
+                                except Exception as e:
+                                    logger.error(f"Failed to parse streaming chunk: {e}; line: {line}")
+                                    yield f"{line}\n\n"  # fallback: yield original
+                    # Process any remaining data in the buffer
+                    if buffer.strip():
+                        try:
+                            json_str = buffer.strip()
+                            if json_str.startswith('data: '):
+                                json_str = json_str[6:]
+                            if json_str.strip() != '[DONE]':
+                                chunk_obj = ChatCompletionChunk.parse_raw(json_str)
+                                yield f"data: {chunk_obj.json()}\n\n"
+                            else:
+                                yield 'data: [DONE]\n\n'
+                        except Exception as e:
+                            logger.error(f"Failed to parse trailing streaming chunk: {e}; buffer: {buffer}")
+                            yield f"{buffer}\n\n"
+            except httpx.TimeoutException:
+                logger.error("Streaming request timed out")
+                yield f"data: {{\"error\":{{\"message\":\"Request timed out\",\"code\":408}}}}\n\n"
+            except Exception as e:
+                logger.error(f"Error during streaming: {e}")
+                yield f"data: {{\"error\":{{\"message\":\"{str(e)}\",\"code\":500}}}}\n\n"
+                yield "data: [DONE]\n\n"
+        return StreamingResponse(
+            stream_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+
+    async def handle_non_streaming(instance_url, request_payload):
+        try:
+            response = await app.state.client.post(
+                f"{instance_url}/v1/chat/completions",
+                headers={"Authorization": f"Bearer {API_KEY}"},
+                json=request_payload,
+                timeout=HTTP_TIMEOUT
+            )
+            if response.status_code != 200:
+                error_text = await response.text()
+                logger.error(f"Backend error: {response.status_code} - {error_text}")
+                if response.status_code == 400:
+                    raise HTTPException(status_code=400, detail=error_text)
+                raise HTTPException(status_code=response.status_code, detail=error_text)
+            try:
+                completion_obj = ChatCompletionResponse.parse_obj(response.json())
+                return completion_obj.dict()
+            except Exception as e:
+                logger.error(f"Failed to parse ChatCompletionResponse: {e}")
+                raise HTTPException(status_code=500, detail="Invalid response format from backend")
+        except httpx.TimeoutException:
+            logger.error("Request timed out")
+            raise HTTPException(status_code=408, detail="Request timed out")
+        except httpx.RequestError as e:
+            logger.error(f"Request error: {str(e)}")
+            raise HTTPException(status_code=503, detail="Service unavailable")
+
+    try:
+        is_healthy, (instance_url, model_id) = await get_healthy_instance()
+        request_payload = build_request_payload(chat_request, model_id, is_healthy)
+        if request_payload.get("stream"):
+            return await handle_streaming(instance_url, request_payload)
+        else:
+            return await handle_non_streaming(instance_url, request_payload)
     except HTTPException:
         raise
     except Exception as e:
