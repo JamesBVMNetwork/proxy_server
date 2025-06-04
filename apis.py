@@ -87,7 +87,7 @@ rate_limit_state = defaultdict(lambda: {"count": 0, "window_start": time.time()}
 async def check_instance_health(url: str) -> bool:
     """Check if an instance is healthy"""
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(f"{url}/health")
             return response.status_code == 200
     except Exception:
@@ -188,7 +188,7 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"error": {"message": "Internal server error", "code": 500}}
     )
 
-def build_request_payload(chat_request, model_id, is_healthy):
+async def build_request_payload(chat_request, model_id, is_healthy):
     logger.info("Calling build_request_payload")
     # Set default parameters
     chat_request.model = model_id
@@ -324,7 +324,7 @@ async def chat_completions(
 
     try:
         is_healthy, (instance_url, model_id) = await get_healthy_instance()
-        request_payload = build_request_payload(chat_request, model_id, is_healthy)
+        request_payload = await build_request_payload(chat_request, model_id, is_healthy)
         if request_payload.get("stream"):
             return await handle_streaming(instance_url, request_payload)
         else:
